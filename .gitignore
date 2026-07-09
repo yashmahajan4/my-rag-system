@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+storage/chroma_db/
+.venv/
+venv/
+poetry.lock
+.idea/
+.vscode/
