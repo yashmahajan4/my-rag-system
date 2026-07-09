@@ -1,215 +1,263 @@
 import time
 
-from src.preprocessing.chunking import chunk_document, extract_section
-
 from src.config import Config
-
-from src.preprocessing.file_utils import (
-    get_source_signature,
-    build_source_metadata,
-    sha256_text,
-    is_url,
-)
-
 from src.pipeline.chunking_ui import choose_chunking_strategies
+from src.preprocessing.chunking import (
+    apply_multiple_chunking_strategies,
+    chunk_document,
+    extract_section,
+    load_and_clean_document,
+)
+from src.preprocessing.file_utils import (
+    build_source_metadata,
+    get_source_signature,
+    is_url,
+    sha256_text,
+)
 
 
 def sanitize_metadata(metadata):
-
     cleaned = {}
 
     for key, value in metadata.items():
-
-        # Chroma-supported types
         if isinstance(value, (str, int, float, bool)):
             cleaned[key] = value
-
-        # Convert None
         elif value is None:
             cleaned[key] = ""
-
-        # Convert everything else safely
         else:
             cleaned[key] = str(value)
 
     return cleaned
 
 
-# ============================================================
-# MAIN INGESTION PIPELINE
-# ============================================================
-def process_document(source, db):
+def _print_box_title(title):
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
 
-    content_hash = None
 
-    if is_url(source):
+def _safe_collection_count(collection, file_hash):
+    try:
+        data = collection.get(where={"filehash": file_hash}, include=["metadatas"])
+        return len(data.get("ids", []))
+    except Exception:
+        return 0
 
-        from src.loaders.document_loader import load_document
 
-        docs = load_document(source)
+def _show_existing_source_details(collection_name, source_name, file_hash, db):
+    collection = db.get_collection(collection_name)
+    data = db.get_file_records(collection, file_hash)
 
-        full_text = "\n".join(doc.page_content for doc in docs)
+    ids = data.get("ids", [])
+    metadatas = data.get("metadatas", [])
 
-        content_hash = sha256_text(full_text)
+    print("\n📌 Existing source detected")
+    print("-" * 60)
+    print(f"Collection : {collection_name}")
+    print(f"Source     : {source_name}")
+    print(f"Chunks     : {len(ids)}")
 
-    source_name, _, file_hash = get_source_signature(source, content_hash)
+    if metadatas:
+        sample = metadatas[0] or {}
+        print(f"Type       : {sample.get('source_type', 'Unknown')}")
+        print(f"Chunking   : {sample.get('chunking_combo', sample.get('chunking', 'Unknown'))}")
+        print(f"Version    : {sample.get('version', 'Unknown')}")
+    print("-" * 60)
 
-    source_metadata = build_source_metadata(source, content_hash)
 
-    collections = db.list_collections()
+def _handle_existing_source(collection, collection_name, source_name, file_hash, db):
+    _print_box_title("🔁 SOURCE ALREADY EXISTS")
 
-    collection = None
+    _show_existing_source_details(
+        collection_name=collection_name,
+        source_name=source_name,
+        file_hash=file_hash,
+        db=db,
+    )
 
-    # ========================================================
-    # DUPLICATE CHECK
-    # ========================================================
-    for col in collections:
+    print("""
+Choose what to do next:
 
-        c = db.get_collection(col.name)
-
-        if db.file_exists_in_collection(c, file_hash):
-
-            print(f"\n✅ Source already exists " f"in collection: {col.name}")
-
-            while True:
-
-                choice = input("""
 1. Skip
+   Keep existing data as-is and do not ingest this source again.
+
 2. Re-embed
+   Delete the old stored chunks for this same source from this collection,
+   then ingest it again using your CURRENT models/settings/chunking choices.
+
 3. Replace
+   Same result as re-embed in the current system:
+   remove old stored chunks for this source and insert fresh content again.
 
-Choice:
-""").strip()
-
-                if choice == "1":
-                    return c, False
-
-                elif choice == "2":
-                    collection = c
-                    break
-
-                elif choice == "3":
-
-                    print("🧹 Removing old content...")
-
-                    c.delete(where={"file_hash": file_hash})
-
-                    collection = c
-                    break
-
-                else:
-                    print("❌ Invalid choice")
-
-            break
-
-    # ========================================================
-    # COLLECTION SELECTION
-    # ========================================================
-    if not collection:
-
-        print("\n🆕 New source detected")
-
-        print("""
-Choose storage option:
-
-1. Merge into existing collection
-2. Create new collection
+⚠️ Note:
+In your current architecture, Re-embed and Replace behave almost the same.
+They are both kept for clarity and backward compatibility.
 """)
 
-        while True:
+    while True:
+        choice = input("Enter choice (1/2/3): ").strip()
 
-            choice = input("Enter choice: ").strip()
-
-            if choice not in ["1", "2"]:
-
-                print("❌ Invalid choice")
-
-                continue
-
-            break
-
-        # ----------------------------------------------------
-        # MERGE
-        # ----------------------------------------------------
         if choice == "1":
+            print("\n⏭️ Skipped ingestion. Existing stored source was kept unchanged.")
+            return collection, False
 
+        if choice in {"2", "3"}:
+            removed = db.delete_file_from_collection(collection, file_hash)
+
+            print("\n🧹 Old source content removed")
+            print(f"Collection : {collection_name}")
+            print(f"Source     : {source_name}")
+            print(f"Deleted    : {removed} chunk(s)")
+
+            return collection, True
+
+        print("❌ Invalid choice. Please enter 1, 2, or 3.")
+
+
+def _choose_collection_for_new_source(source_name, collections, db):
+    _print_box_title("🆕 NEW SOURCE DETECTED")
+
+    print("Choose where to store this source:\n")
+    print("1. Merge into existing collection")
+    print("2. Create new collection")
+
+    while True:
+        choice = input("\nEnter choice (1/2): ").strip()
+
+        if choice not in {"1", "2"}:
+            print("❌ Invalid choice. Please enter 1 or 2.")
+            continue
+
+        if choice == "1":
             if not collections:
-
-                print("❌ No collections exist")
-
+                print("\n⚠️ No existing collections found.")
+                print("➡️ Switching to: Create new collection")
                 choice = "2"
-
             else:
-
-                print("\n📚 Existing Collections:")
+                print("\n📚 Existing Collections")
+                print("-" * 60)
 
                 for i, col in enumerate(collections, start=1):
-                    print(f"{i}. {col.name}")
+                    try:
+                        current_collection = db.get_collection(col.name)
+                        files = db.list_files_in_collection(current_collection)
+                        file_count = len(files)
+                    except Exception:
+                        file_count = "?"
+
+                    print(f"{i}. {col.name}  |  files: {file_count}")
+
+                print("-" * 60)
 
                 while True:
-
-                    selected = input("\nSelect collection: ").strip()
+                    selected = input("Select collection number: ").strip()
 
                     if not selected.isdigit():
-
-                        print("❌ Enter a number")
-
+                        print("❌ Please enter a valid number.")
                         continue
 
                     idx = int(selected) - 1
 
                     if idx < 0 or idx >= len(collections):
-
-                        print("❌ Out of range")
-
+                        print("❌ Selection out of range.")
                         continue
 
                     collection_name = collections[idx].name
+                    collection = db.get_collection(collection_name)
 
-                    break
+                    print("\n✅ Selected collection")
+                    print(f"Collection : {collection_name}")
+                    print(f"New Source : {source_name}")
 
-        # ----------------------------------------------------
-        # CREATE
-        # ----------------------------------------------------
+                    return collection
+
         if choice == "2":
+            while True:
+                collection_name = input("Enter collection name: ").strip()
 
-            collection_name = input("Enter collection name: ").strip()
+                if not collection_name:
+                    collection_name = source_name
 
-            if not collection_name:
+                if collection_name:
+                    collection = db.get_collection(collection_name)
+                    print("\n✅ Collection ready")
+                    print(f"Collection : {collection_name}")
+                    print(f"New Source : {source_name}")
+                    return collection
 
-                collection_name = source_name
+                print("❌ Collection name cannot be empty.")
 
-        collection = db.get_collection(collection_name)
 
-        # additional safety
+# ============================================================
+# MAIN INGESTION PIPELINE
+# ============================================================
+def process_document(source, db):
+    content_hash = None
+
+    if is_url(source):
+        from src.loaders.document_loader import load_document
+
+        docs = load_document(source)
+        full_text = "\n".join(doc.page_content for doc in docs)
+        content_hash = sha256_text(full_text)
+
+    source_name, _, file_hash = get_source_signature(source, content_hash)
+    source_metadata = build_source_metadata(source, content_hash)
+
+    collections = db.list_collections()
+    collection = None
+
+    # ========================================================
+    # DUPLICATE CHECK ACROSS COLLECTIONS
+    # ========================================================
+    for col in collections:
+        c = db.get_collection(col.name)
+
+        if db.file_exists_in_collection(c, file_hash):
+            collection, should_continue = _handle_existing_source(
+                collection=c,
+                collection_name=col.name,
+                source_name=source_name,
+                file_hash=file_hash,
+                db=db,
+            )
+
+            if not should_continue:
+                return collection, False
+
+            break
+
+    # ========================================================
+    # COLLECTION SELECTION FOR NEW SOURCE
+    # ========================================================
+    if not collection:
+        collection = _choose_collection_for_new_source(
+            source_name=source_name,
+            collections=collections,
+            db=db,
+        )
+
         if db.file_exists_in_collection(collection, file_hash):
-
-            print("✅ Source already exists " "inside selected collection")
-
-            return (collection, False)
+            _print_box_title("ℹ️ SOURCE ALREADY EXISTS IN SELECTED COLLECTION")
+            print(f"Collection : {getattr(collection, 'name', 'Unknown')}")
+            print(f"Source     : {source_name}")
+            print("\nNo new ingestion was performed because this source is already stored there.")
+            return collection, False
 
     # ========================================================
     # CHUNKING
     # ========================================================
     strategies = choose_chunking_strategies()
 
-    print("\n⚡ Processing using " f"{len(strategies)} strategy(s)")
+    print(f"\n⚡ Processing using {len(strategies)} strategy(s)")
 
-    all_chunks = []
+    if len(strategies) == 1:
+        all_chunks = chunk_document(source, strategy=strategies[0])
+    else:
+        docs = load_and_clean_document(source)
+        all_chunks = apply_multiple_chunking_strategies(docs, strategies)
 
-    for strategy in strategies:
-
-        print(f"\n⚙️ Applying " f"{strategy}")
-
-        chunks = chunk_document(source, strategy=strategy)
-
-        for chunk in chunks:
-
-            chunk.metadata["chunking"] = strategy
-
-        all_chunks.extend(chunks)
-
-    print(f"\n✅ Total chunks: " f"{len(all_chunks)}")
+    print(f"\n✅ Final chunk count to store: {len(all_chunks)}")
 
     # ========================================================
     # METADATA
@@ -219,9 +267,9 @@ Choose storage option:
     ids = []
 
     version = int(time.time())
+    strategy_combo = ",".join(strategies)
 
     for i, chunk in enumerate(all_chunks):
-
         docs.append(chunk.page_content)
 
         page_value = chunk.metadata.get("page")
@@ -233,27 +281,21 @@ Choose storage option:
             "source_name": str(source_metadata.get("source_name", "")),
             "source_type": str(source_metadata.get("source_type", "")),
             "source": str(source_metadata.get("source", "")),
-            "file_hash": str(source_metadata.get("file_hash", "")),
+            "filehash": str(source_metadata.get("file_hash", "")),
             "page": page_value,
             "section": str(extract_section(chunk.page_content)),
             "chunking": str(chunk.metadata.get("chunking", "")),
+            "chunking_combo": strategy_combo,
             "version": int(version),
             "ingested_at": int(time.time()),
         }
 
         metadata = sanitize_metadata(metadata)
-
-        # #   Tempory Debugging
-        #     if i == 0:
-        #         print("\n🔍 Metadata Debug:")
-        #         for k, v in metadata.items():
-        #             print(
-        #                 f"{k} -> {type(v)} -> {repr(v)}"
-        #             )
-
         metas.append(metadata)
 
-        ids.append(f"{source_name}_" f"{file_hash}_" f"{i}")
+        ids.append(
+            f"{source_name}_{file_hash}_{metadata['chunking']}_{i}"
+        )
 
     # ========================================================
     # STORE
@@ -261,14 +303,13 @@ Choose storage option:
     db.insert_batches(collection, docs, metas, ids, Config.BATCH_SIZE)
 
     print("\n✅ Content stored successfully")
+    print(f"📄 Source       : {source_metadata['source_name']}")
+    print(f"📦 Type         : {source_metadata['source_type']}")
+    print(f"🗂️ Collection   : {getattr(collection, 'name', 'Unknown')}")
+    print(f"🧩 Strategies   : {strategy_combo}")
+    print(f"🧩 Chunks       : {len(all_chunks)}")
 
-    print(f"📄 Source       : " f"{source_metadata['source_name']}")
-
-    print(f"📦 Type         : " f"{source_metadata['source_type']}")
-
-    print(f"🧩 Chunks       : " f"{len(all_chunks)}")
-
-    return (collection, True)
+    return collection, True
 
 
 # ============================================================

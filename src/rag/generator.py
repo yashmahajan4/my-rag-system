@@ -21,4 +21,12 @@ def generate_answer(prompt):
         temperature=Config.TEMPERATURE,
     )
 
-    return response.choices[0].message.content
+    if not response.choices:
+        raise ValueError("❌ Empty response from chat model")
+
+    message = response.choices[0].message
+
+    if not message or not getattr(message, "content", None):
+        raise ValueError("❌ Chat model returned empty content")
+
+    return message.content.strip()

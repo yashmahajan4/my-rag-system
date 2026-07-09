@@ -7,3 +7,5 @@ venv/
 poetry.lock
 .idea/
 .vscode/
+script.py
+Python_Code_Collection.txt
